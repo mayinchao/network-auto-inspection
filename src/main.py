@@ -6,10 +6,14 @@ from pathlib import Path
 
 import paramiko
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-# =========================
-# 项目目录
-# =========================
+
+# ============================================================
+# 项目路径
+# ============================================================
 
 DEVICE_FILE = Path("config/devices.csv")
 
@@ -19,9 +23,9 @@ LOG_DIR = Path("logs")
 REPORT_DIR = Path("reports")
 
 
-# =========================
+# ============================================================
 # 不同设备类型的巡检命令
-# =========================
+# ============================================================
 
 COMMANDS = {
     "windows": [
@@ -32,18 +36,18 @@ COMMANDS = {
 }
 
 
-# =========================
+# ============================================================
 # 不同设备类型的配置备份命令
-# =========================
+# ============================================================
 
 BACKUP_COMMANDS = {
     "windows": "ipconfig /all",
 }
 
 
-# =========================
+# ============================================================
 # 日志系统
-# =========================
+# ============================================================
 
 def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
@@ -51,7 +55,6 @@ def setup_logging():
     logger = logging.getLogger("network_inspection")
     logger.setLevel(logging.INFO)
 
-    # 防止重复添加 Handler
     if logger.handlers:
         return logger
 
@@ -78,13 +81,14 @@ def setup_logging():
 logger = setup_logging()
 
 
-# =========================
-# 编码处理
-# =========================
+# ============================================================
+# 命令输出编码处理
+# ============================================================
 
 def decode_output(data: bytes) -> str:
     """
-    尝试使用 UTF-8 和 GBK 解码远程命令输出。
+    尝试处理 Windows 中文输出。
+    后续接入华为设备时也可以继续扩展。
     """
 
     for encoding in ("utf-8", "gbk"):
@@ -99,9 +103,9 @@ def decode_output(data: bytes) -> str:
     )
 
 
-# =========================
-# 读取设备清单
-# =========================
+# ============================================================
+# 加载设备清单
+# ============================================================
 
 def load_devices():
     devices = []
@@ -121,9 +125,9 @@ def load_devices():
     return devices
 
 
-# =========================
+# ============================================================
 # SSH连接
-# =========================
+# ============================================================
 
 def connect_device(device, password):
     client = paramiko.SSHClient()
@@ -137,11 +141,9 @@ def connect_device(device, password):
         port=device["port"],
         username=device["username"],
         password=password,
-
         timeout=10,
         auth_timeout=10,
         banner_timeout=10,
-
         look_for_keys=False,
         allow_agent=False,
     )
@@ -149,9 +151,9 @@ def connect_device(device, password):
     return client
 
 
-# =========================
+# ============================================================
 # 执行单条命令
-# =========================
+# ============================================================
 
 def run_command(client, command):
     stdin, stdout, stderr = client.exec_command(
@@ -169,11 +171,15 @@ def run_command(client, command):
     return output, error
 
 
-# =========================
-# 执行设备巡检
-# =========================
+# ============================================================
+# 执行巡检命令
+# ============================================================
 
-def run_inspection(client, device, timestamp):
+def run_inspection(
+    client,
+    device,
+    timestamp,
+):
     device_type = device["device_type"]
 
     commands = COMMANDS.get(
@@ -246,10 +252,12 @@ def run_inspection(client, device, timestamp):
         output_file,
     )
 
+    return output_file
 
-# =========================
+
+# ============================================================
 # 配置备份
-# =========================
+# ============================================================
 
 def backup_configuration(
     client,
@@ -267,7 +275,7 @@ def backup_configuration(
             "设备 %s 暂无配置备份命令",
             device["name"],
         )
-        return
+        return None
 
     logger.info(
         "设备 %s 执行配置备份命令：%s",
@@ -312,10 +320,12 @@ def backup_configuration(
         backup_file,
     )
 
+    return backup_file
 
-# =========================
+
+# ============================================================
 # 巡检单台设备
-# =========================
+# ============================================================
 
 def inspect_device(
     device,
@@ -398,9 +408,9 @@ def inspect_device(
             client.close()
 
 
-# =========================
-# 生成CSV汇总报告
-# =========================
+# ============================================================
+# CSV汇总报告
+# ============================================================
 
 def generate_csv_report(
     summary_rows,
@@ -442,16 +452,362 @@ def generate_csv_report(
         )
 
     logger.info(
-        "巡检汇总报告保存至 %s",
+        "CSV巡检报告保存至 %s",
         report_file,
     )
 
     return report_file
 
 
-# =========================
+# ============================================================
+# Excel汇总报告
+# ============================================================
+
+def generate_excel_report(
+    summary_rows,
+    timestamp,
+    success_count,
+    failed_count,
+):
+    REPORT_DIR.mkdir(
+        exist_ok=True
+    )
+
+    report_file = (
+        REPORT_DIR
+        / f"inspection_summary_{timestamp}.xlsx"
+    )
+
+    workbook = Workbook()
+
+    # --------------------------------------------------------
+    # 巡检汇总 Sheet
+    # --------------------------------------------------------
+
+    sheet = workbook.active
+    sheet.title = "巡检汇总"
+
+    sheet.merge_cells(
+        "A1:G1"
+    )
+
+    title_cell = sheet["A1"]
+    title_cell.value = "网络设备自动巡检汇总报告"
+    title_cell.font = Font(
+        bold=True,
+        size=16,
+    )
+    title_cell.alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+    )
+
+    sheet.row_dimensions[1].height = 28
+
+    sheet["A2"] = "生成时间"
+    sheet["B2"] = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    headers = [
+        "巡检时间",
+        "设备名称",
+        "管理地址",
+        "SSH端口",
+        "设备类型",
+        "状态",
+        "说明",
+    ]
+
+    header_row = 4
+
+    for column_index, header in enumerate(
+        headers,
+        start=1,
+    ):
+        cell = sheet.cell(
+            row=header_row,
+            column=column_index,
+        )
+
+        cell.value = header
+
+        cell.font = Font(
+            bold=True
+        )
+
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+        cell.fill = PatternFill(
+            fill_type="solid",
+            fgColor="D9EAF7",
+        )
+
+    for row_index, row_data in enumerate(
+        summary_rows,
+        start=5,
+    ):
+        values = [
+            row_data["time"],
+            row_data["name"],
+            row_data["host"],
+            row_data["port"],
+            row_data["device_type"],
+            row_data["status"],
+            row_data["message"],
+        ]
+
+        for column_index, value in enumerate(
+            values,
+            start=1,
+        ):
+            cell = sheet.cell(
+                row=row_index,
+                column=column_index,
+            )
+
+            cell.value = value
+
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
+        status_cell = sheet.cell(
+            row=row_index,
+            column=6,
+        )
+
+        status_cell.font = Font(
+            bold=True
+        )
+
+        status_cell.alignment = Alignment(
+            horizontal="center",
+        )
+
+        if row_data["status"] == "SUCCESS":
+            status_cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor="C6EFCE",
+            )
+        else:
+            status_cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor="FFC7CE",
+            )
+
+    sheet.freeze_panes = "A5"
+
+    if summary_rows:
+        sheet.auto_filter.ref = (
+            f"A4:G{sheet.max_row}"
+        )
+
+    column_widths = {
+        "A": 21,
+        "B": 18,
+        "C": 18,
+        "D": 12,
+        "E": 16,
+        "F": 12,
+        "G": 55,
+    }
+
+    for column, width in column_widths.items():
+        sheet.column_dimensions[
+            column
+        ].width = width
+
+    # --------------------------------------------------------
+    # 统计 Sheet
+    # --------------------------------------------------------
+
+    stats_sheet = workbook.create_sheet(
+        "统计"
+    )
+
+    stats_sheet.merge_cells(
+        "A1:B1"
+    )
+
+    stats_sheet["A1"] = "巡检统计"
+
+    stats_sheet["A1"].font = Font(
+        bold=True,
+        size=15,
+    )
+
+    stats_sheet["A1"].alignment = Alignment(
+        horizontal="center",
+    )
+
+    total_count = len(
+        summary_rows
+    )
+
+    if total_count:
+        success_rate = (
+            success_count / total_count
+        )
+    else:
+        success_rate = 0
+
+    stats_data = [
+        ("设备总数", total_count),
+        ("巡检成功", success_count),
+        ("巡检失败", failed_count),
+        ("成功率", success_rate),
+    ]
+
+    for row_index, (
+        label,
+        value,
+    ) in enumerate(
+        stats_data,
+        start=3,
+    ):
+        stats_sheet.cell(
+            row=row_index,
+            column=1,
+            value=label,
+        )
+
+        stats_sheet.cell(
+            row=row_index,
+            column=2,
+            value=value,
+        )
+
+        stats_sheet.cell(
+            row=row_index,
+            column=1,
+        ).font = Font(
+            bold=True
+        )
+
+    stats_sheet["B6"].number_format = "0.00%"
+
+    stats_sheet.column_dimensions[
+        "A"
+    ].width = 18
+
+    stats_sheet.column_dimensions[
+        "B"
+    ].width = 18
+
+    # --------------------------------------------------------
+    # 异常设备 Sheet
+    # --------------------------------------------------------
+
+    failed_devices = [
+        row
+        for row in summary_rows
+        if row["status"] == "FAILED"
+    ]
+
+    error_sheet = workbook.create_sheet(
+        "异常设备"
+    )
+
+    error_headers = [
+        "时间",
+        "设备名称",
+        "地址",
+        "端口",
+        "设备类型",
+        "失败原因",
+    ]
+
+    for column_index, header in enumerate(
+        error_headers,
+        start=1,
+    ):
+        cell = error_sheet.cell(
+            row=1,
+            column=column_index,
+            value=header,
+        )
+
+        cell.font = Font(
+            bold=True
+        )
+
+        cell.fill = PatternFill(
+            fill_type="solid",
+            fgColor="F4CCCC",
+        )
+
+        cell.alignment = Alignment(
+            horizontal="center",
+        )
+
+    for row_index, row_data in enumerate(
+        failed_devices,
+        start=2,
+    ):
+        values = [
+            row_data["time"],
+            row_data["name"],
+            row_data["host"],
+            row_data["port"],
+            row_data["device_type"],
+            row_data["message"],
+        ]
+
+        for column_index, value in enumerate(
+            values,
+            start=1,
+        ):
+            cell = error_sheet.cell(
+                row=row_index,
+                column=column_index,
+                value=value,
+            )
+
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
+    error_widths = {
+        "A": 21,
+        "B": 18,
+        "C": 18,
+        "D": 12,
+        "E": 16,
+        "F": 60,
+    }
+
+    for column, width in error_widths.items():
+        error_sheet.column_dimensions[
+            column
+        ].width = width
+
+    error_sheet.freeze_panes = "A2"
+
+    # --------------------------------------------------------
+    # 保存Excel
+    # --------------------------------------------------------
+
+    workbook.save(
+        report_file
+    )
+
+    logger.info(
+        "Excel巡检报告保存至 %s",
+        report_file,
+    )
+
+    return report_file
+
+
+# ============================================================
 # 主程序
-# =========================
+# ============================================================
 
 def main():
     devices = load_devices()
@@ -516,6 +872,13 @@ def main():
     generate_csv_report(
         summary_rows,
         timestamp,
+    )
+
+    generate_excel_report(
+        summary_rows,
+        timestamp,
+        success_count,
+        failed_count,
     )
 
     logger.info(
