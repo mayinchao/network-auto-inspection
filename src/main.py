@@ -7,13 +7,22 @@ from pathlib import Path
 import paramiko
 
 
+# =========================
+# 项目目录
+# =========================
+
 DEVICE_FILE = Path("config/devices.csv")
+
 OUTPUT_DIR = Path("output")
 BACKUP_DIR = Path("backup")
 LOG_DIR = Path("logs")
+REPORT_DIR = Path("reports")
 
 
-# 不同类型设备对应不同巡检命令
+# =========================
+# 不同设备类型的巡检命令
+# =========================
+
 COMMANDS = {
     "windows": [
         "hostname",
@@ -23,11 +32,18 @@ COMMANDS = {
 }
 
 
-# 不同类型设备对应不同配置备份命令
+# =========================
+# 不同设备类型的配置备份命令
+# =========================
+
 BACKUP_COMMANDS = {
     "windows": "ipconfig /all",
 }
 
+
+# =========================
+# 日志系统
+# =========================
 
 def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
@@ -35,6 +51,7 @@ def setup_logging():
     logger = logging.getLogger("network_inspection")
     logger.setLevel(logging.INFO)
 
+    # 防止重复添加 Handler
     if logger.handlers:
         return logger
 
@@ -61,15 +78,30 @@ def setup_logging():
 logger = setup_logging()
 
 
+# =========================
+# 编码处理
+# =========================
+
 def decode_output(data: bytes) -> str:
+    """
+    尝试使用 UTF-8 和 GBK 解码远程命令输出。
+    """
+
     for encoding in ("utf-8", "gbk"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
 
-    return data.decode("utf-8", errors="replace")
+    return data.decode(
+        "utf-8",
+        errors="replace",
+    )
 
+
+# =========================
+# 读取设备清单
+# =========================
 
 def load_devices():
     devices = []
@@ -79,6 +111,7 @@ def load_devices():
         encoding="utf-8-sig",
         newline="",
     ) as file:
+
         reader = csv.DictReader(file)
 
         for row in reader:
@@ -88,8 +121,13 @@ def load_devices():
     return devices
 
 
+# =========================
+# SSH连接
+# =========================
+
 def connect_device(device, password):
     client = paramiko.SSHClient()
+
     client.set_missing_host_key_policy(
         paramiko.AutoAddPolicy()
     )
@@ -99,9 +137,11 @@ def connect_device(device, password):
         port=device["port"],
         username=device["username"],
         password=password,
+
         timeout=10,
         auth_timeout=10,
         banner_timeout=10,
+
         look_for_keys=False,
         allow_agent=False,
     )
@@ -109,8 +149,14 @@ def connect_device(device, password):
     return client
 
 
+# =========================
+# 执行单条命令
+# =========================
+
 def run_command(client, command):
-    stdin, stdout, stderr = client.exec_command(command)
+    stdin, stdout, stderr = client.exec_command(
+        command
+    )
 
     output = decode_output(
         stdout.read()
@@ -123,10 +169,16 @@ def run_command(client, command):
     return output, error
 
 
+# =========================
+# 执行设备巡检
+# =========================
+
 def run_inspection(client, device, timestamp):
     device_type = device["device_type"]
 
-    commands = COMMANDS.get(device_type)
+    commands = COMMANDS.get(
+        device_type
+    )
 
     if commands is None:
         raise ValueError(
@@ -136,6 +188,7 @@ def run_inspection(client, device, timestamp):
     results = []
 
     for command in commands:
+
         logger.info(
             "设备 %s 执行巡检命令：%s",
             device["name"],
@@ -163,11 +216,19 @@ def run_inspection(client, device, timestamp):
                 error,
             ])
 
+            logger.warning(
+                "设备 %s 命令 %s 存在错误输出",
+                device["name"],
+                command,
+            )
+
         results.append(
             "\n".join(section)
         )
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        exist_ok=True
+    )
 
     output_file = (
         OUTPUT_DIR
@@ -186,7 +247,15 @@ def run_inspection(client, device, timestamp):
     )
 
 
-def backup_configuration(client, device, timestamp):
+# =========================
+# 配置备份
+# =========================
+
+def backup_configuration(
+    client,
+    device,
+    timestamp,
+):
     device_type = device["device_type"]
 
     command = BACKUP_COMMANDS.get(
@@ -244,7 +313,15 @@ def backup_configuration(client, device, timestamp):
     )
 
 
-def inspect_device(device, password, timestamp):
+# =========================
+# 巡检单台设备
+# =========================
+
+def inspect_device(
+    device,
+    password,
+    timestamp,
+):
     client = None
 
     try:
@@ -277,40 +354,112 @@ def inspect_device(device, password, timestamp):
             timestamp,
         )
 
-        return True
+        return True, "巡检成功"
 
     except paramiko.AuthenticationException:
+        message = "SSH认证失败"
+
         logger.error(
-            "设备 %s SSH认证失败",
+            "设备 %s %s",
             device["name"],
+            message,
         )
+
+        return False, message
 
     except paramiko.SSHException as error:
-        logger.error(
-            "设备 %s SSH协议错误：%s",
-            device["name"],
-            error,
+        message = (
+            f"SSH协议错误：{error}"
         )
 
-    except Exception as error:
         logger.error(
-            "设备 %s 巡检失败：%s",
+            "设备 %s %s",
             device["name"],
-            error,
+            message,
         )
+
+        return False, message
+
+    except Exception as error:
+        message = (
+            f"巡检失败：{error}"
+        )
+
+        logger.error(
+            "设备 %s %s",
+            device["name"],
+            message,
+        )
+
+        return False, message
 
     finally:
         if client is not None:
             client.close()
 
-    return False
 
+# =========================
+# 生成CSV汇总报告
+# =========================
+
+def generate_csv_report(
+    summary_rows,
+    timestamp,
+):
+    REPORT_DIR.mkdir(
+        exist_ok=True
+    )
+
+    report_file = (
+        REPORT_DIR
+        / f"inspection_summary_{timestamp}.csv"
+    )
+
+    fieldnames = [
+        "time",
+        "name",
+        "host",
+        "port",
+        "device_type",
+        "status",
+        "message",
+    ]
+
+    with report_file.open(
+        "w",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+        writer.writerows(
+            summary_rows
+        )
+
+    logger.info(
+        "巡检汇总报告保存至 %s",
+        report_file,
+    )
+
+    return report_file
+
+
+# =========================
+# 主程序
+# =========================
 
 def main():
     devices = load_devices()
 
     if not devices:
-        logger.warning("设备清单为空")
+        logger.warning(
+            "设备清单为空"
+        )
         return
 
     logger.info(
@@ -322,7 +471,9 @@ def main():
         len(devices),
     )
 
-    password = getpass("SSH password: ")
+    password = getpass(
+        "SSH password: "
+    )
 
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
@@ -331,8 +482,11 @@ def main():
     success_count = 0
     failed_count = 0
 
+    summary_rows = []
+
     for device in devices:
-        success = inspect_device(
+
+        success, message = inspect_device(
             device,
             password,
             timestamp,
@@ -342,6 +496,27 @@ def main():
             success_count += 1
         else:
             failed_count += 1
+
+        summary_rows.append({
+            "time": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "name": device["name"],
+            "host": device["host"],
+            "port": device["port"],
+            "device_type": device["device_type"],
+            "status": (
+                "SUCCESS"
+                if success
+                else "FAILED"
+            ),
+            "message": message,
+        })
+
+    generate_csv_report(
+        summary_rows,
+        timestamp,
+    )
 
     logger.info(
         "巡检结束 | 总数=%s | 成功=%s | 失败=%s",

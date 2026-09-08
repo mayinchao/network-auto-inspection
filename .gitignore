@@ -6,3 +6,4 @@ output/
 backup/
 logs/
 config/devices.csv
+reports/
