@@ -1,2 +1,3 @@
 name,host,port,username,device_type
 WIN-TEST,127.0.0.1,22,netauto,windows
+AR1,127.0.0.1,2000,,huawei_console
