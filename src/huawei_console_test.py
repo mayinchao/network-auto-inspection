@@ -6,26 +6,68 @@ from pathlib import Path
 
 
 # ============================================================
-# 基础配置
+# 项目路径
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+OUTPUT_DIR = BASE_DIR / "output"
+BACKUP_DIR = BASE_DIR / "backup"
+DEBUG_DIR = BASE_DIR / "output" / "debug"
+
+
+# ============================================================
+# Huawei 设备信息
 # ============================================================
 
 HOST = "127.0.0.1"
 PORT = 2000
 DEVICE_NAME = "AR1"
 
-OUTPUT_DIR = Path("output")
-BACKUP_DIR = Path("backup")
 
+# ============================================================
+# 巡检命令
+# ============================================================
 
-# 普通巡检命令
 INSPECTION_COMMANDS = [
-    "display version",
-    "display ip interface brief",
-    "display ip routing-table",
+    {
+        "command": "display version",
+        "required_any": [
+            "Huawei Versatile Routing Platform",
+            "VRP (R) software",
+            "VRP",
+        ],
+        "timeout": 30,
+    },
+    {
+        "command": "display ip interface brief",
+        "required_any": [
+            "IP Address/Mask",
+            "Physical",
+            "Protocol",
+        ],
+        "timeout": 30,
+    },
+    {
+        "command": "display ip routing-table",
+        "required_any": [
+            "Routing Tables",
+            "Destination/Mask",
+            "Route Flags",
+        ],
+        "timeout": 30,
+    },
 ]
 
-# 配置备份命令
-BACKUP_COMMAND = "display current-configuration"
+
+BACKUP_COMMAND = {
+    "command": "display current-configuration",
+    "required_all": [
+        f"sysname {DEVICE_NAME}",
+        "return",
+    ],
+    "timeout": 120,
+}
 
 
 # ============================================================
@@ -37,51 +79,38 @@ MORE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+
 ANSI_PATTERN = re.compile(
     r"\x1b\[[0-9;?]*[A-Za-z]"
 )
 
 
 # ============================================================
-# 终端输出清理
+# 文本清理
 # ============================================================
-
-def process_backspaces(text):
-    """
-    模拟终端中的退格效果。
-
-    Huawei Console 在分页时可能输出大量 \b，
-    如果不处理，保存文件中会出现杂乱字符。
-    """
-
-    result = []
-
-    for char in text:
-        if char == "\x08":
-            if result:
-                result.pop()
-        else:
-            result.append(char)
-
-    return "".join(result)
-
 
 def normalize_terminal_output(text):
     """
-    清除 ANSI 控制符、NUL 和退格影响，
-    但暂时保留 ---- More ----，
-    供程序判断是否需要翻页。
+    做最基础的终端清理。
+
+    注意：
+    不再使用“退格就删除前一个字符”的激进算法，
+    避免把 Huawei 的真实输出误删。
     """
 
-    text = ANSI_PATTERN.sub("", text)
+    text = ANSI_PATTERN.sub(
+        "",
+        text,
+    )
 
     text = text.replace(
         "\x00",
         "",
     )
 
-    text = process_backspaces(
-        text
+    text = text.replace(
+        "\r",
+        "",
     )
 
     return text
@@ -89,37 +118,48 @@ def normalize_terminal_output(text):
 
 def clean_terminal_output(text):
     """
-    生成最终可保存的干净文本。
+    用于最终保存的干净文本。
     """
 
     text = normalize_terminal_output(
         text
     )
 
+    # 删除分页文字
     text = MORE_PATTERN.sub(
         "",
         text,
     )
 
-    return text
+    # 删除常见终端控制字符
+    text = text.replace(
+        "\x08",
+        "",
+    )
+
+    text = text.replace(
+        "\x07",
+        "",
+    )
+
+    return text.strip()
 
 
 # ============================================================
-# 判断 Huawei CLI 提示符
+# Huawei CLI 提示符判断
 # ============================================================
 
 def is_device_prompt(line):
     """
-    只接受真正属于 AR1 的 CLI 提示符。
+    只把真正的 Huawei AR1 提示符视为提示符。
 
     合法：
         <AR1>
         [AR1]
 
     不合法：
+        #
         [V200R003C00]
-
-    因此不会再把 VRP 版本行误认为命令结束。
     """
 
     line = line.strip()
@@ -130,27 +170,44 @@ def is_device_prompt(line):
     }
 
 
+def get_last_nonempty_line(text):
+    """
+    取得最后一个非空行。
+    """
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        return ""
+
+    return lines[-1]
+
+
 # ============================================================
-# 清空 Console 缓冲区
+# TCP 缓冲区处理
 # ============================================================
 
 def drain_socket(
     sock,
-    max_wait=0.5,
+    max_wait=0.3,
 ):
     """
-    清除上一条命令遗留在 TCP Console
-    缓冲区里的数据。
-
-    避免旧的 <AR1> 被新命令误判为结束。
+    清除上一次 Console 操作遗留的数据。
     """
 
     old_timeout = sock.gettimeout()
 
-    sock.settimeout(0.1)
+    sock.settimeout(
+        0.1
+    )
 
     deadline = (
-        time.time() + max_wait
+        time.time()
+        + max_wait
     )
 
     data = ""
@@ -158,7 +215,10 @@ def drain_socket(
     while time.time() < deadline:
 
         try:
-            chunk = sock.recv(4096)
+
+            chunk = sock.recv(
+                4096
+            )
 
             if not chunk:
                 break
@@ -169,6 +229,7 @@ def drain_socket(
             )
 
         except socket.timeout:
+
             break
 
     sock.settimeout(
@@ -179,51 +240,163 @@ def drain_socket(
 
 
 # ============================================================
-# 接收完整命令输出
+# Console 简单唤醒
+# ============================================================
+
+def wake_console(sock):
+    """
+    只负责尽量唤醒 Console。
+
+    不再强制要求必须得到 <AR1>，
+    因为 eNSP Console TCP 并不保证每次按回车
+    都重新发送提示符。
+    """
+
+    print(
+        "正在准备 Huawei Console..."
+    )
+
+    old_data = drain_socket(
+        sock,
+        max_wait=0.5,
+    )
+
+    if old_data.strip():
+
+        print(
+            "已清理 Console 历史残留数据"
+        )
+
+    # 只发送普通回车，不再发 Ctrl+C
+    sock.sendall(
+        b"\r\n"
+    )
+
+    time.sleep(
+        0.3
+    )
+
+    response = drain_socket(
+        sock,
+        max_wait=0.5,
+    )
+
+    cleaned = clean_terminal_output(
+        response
+    )
+
+    last_line = get_last_nonempty_line(
+        cleaned
+    )
+
+    if is_device_prompt(
+        last_line
+    ):
+
+        print(
+            f"检测到 Huawei CLI：{last_line}"
+        )
+
+    else:
+
+        print(
+            "Console未主动回显提示符，"
+            "继续通过命令输出进行验证。"
+        )
+
+
+# ============================================================
+# 判断命令结果是否有效
+# ============================================================
+
+def validate_output(
+    text,
+    required_any=None,
+    required_all=None,
+):
+    """
+    判断命令返回结果是否具备预期内容。
+    """
+
+    if required_any:
+
+        if not any(
+            keyword in text
+            for keyword in required_any
+        ):
+
+            return False
+
+    if required_all:
+
+        if not all(
+            keyword in text
+            for keyword in required_all
+        ):
+
+            return False
+
+    return True
+
+
+# ============================================================
+# 自动分页 + 命令接收
 # ============================================================
 
 def receive_command_output(
     sock,
     command,
+    required_any=None,
+    required_all=None,
     timeout=30,
+    quiet_period=1.2,
 ):
     """
-    接收一条 Huawei CLI 命令的完整返回。
+    接收 Huawei 命令输出。
 
-    处理流程：
+    完成条件有两种：
 
-    1. 等待当前命令回显。
-    2. 遇到 ---- More ---- 自动发送空格。
-    3. 持续读取后续内容。
-    4. 最终重新出现 <AR1> 或 [AR1] 才结束。
+    1. 输出已经通过内容校验，并且最后出现真实提示符；
+    2. 输出已经通过内容校验，并且超过 quiet_period
+       没有收到新数据。
+
+    第二种用于兼容 eNSP Console 不稳定回显提示符的情况。
     """
 
     raw_data = ""
 
     deadline = (
-        time.time() + timeout
+        time.time()
+        + timeout
     )
 
-    sock.settimeout(0.5)
-
-    command_seen = False
+    last_receive_time = None
 
     handled_more_count = 0
+
+    sock.settimeout(
+        0.3
+    )
 
     while time.time() < deadline:
 
         try:
-            chunk = sock.recv(4096)
+
+            chunk = sock.recv(
+                4096
+            )
 
             if not chunk:
                 break
 
-            chunk_text = chunk.decode(
+            last_receive_time = (
+                time.time()
+            )
+
+            raw_data += chunk.decode(
                 "utf-8",
                 errors="ignore",
             )
-
-            raw_data += chunk_text
 
             normalized = (
                 normalize_terminal_output(
@@ -231,16 +404,9 @@ def receive_command_output(
                 )
             )
 
-            # ------------------------------------------------
-            # 确认本次命令已经真正进入设备
-            # ------------------------------------------------
-
-            if command in normalized:
-                command_seen = True
-
-            # ------------------------------------------------
-            # 自动处理 ---- More ----
-            # ------------------------------------------------
+            # ================================================
+            # Huawei ---- More ---- 自动翻页
+            # ================================================
 
             current_more_count = len(
                 MORE_PATTERN.findall(
@@ -252,11 +418,11 @@ def receive_command_output(
                 handled_more_count
                 < current_more_count
             ):
+
                 print(
                     "  检测到分页，自动继续..."
                 )
 
-                # Huawei More 翻页只需要空格
                 sock.sendall(
                     b" "
                 )
@@ -267,46 +433,136 @@ def receive_command_output(
                     0.15
                 )
 
-            # ------------------------------------------------
-            # 判断命令是否真正结束
-            # ------------------------------------------------
+            # ================================================
+            # 内容验证
+            # ================================================
 
-            if command_seen:
+            cleaned = clean_terminal_output(
+                raw_data
+            )
 
-                cleaned = (
-                    clean_terminal_output(
-                        raw_data
+            valid = validate_output(
+                cleaned,
+                required_any=required_any,
+                required_all=required_all,
+            )
+
+            if valid:
+
+                last_line = (
+                    get_last_nonempty_line(
+                        cleaned
                     )
                 )
 
-                lines = [
-                    line.strip()
-                    for line
-                    in cleaned.splitlines()
-                    if line.strip()
-                ]
+                # 最理想情况：
+                # 得到真正 Huawei CLI 提示符
+                if is_device_prompt(
+                    last_line
+                ):
 
-                if lines:
-
-                    last_line = (
-                        lines[-1]
-                    )
-
-                    if is_device_prompt(
-                        last_line
-                    ):
-                        return (
-                            cleaned.strip()
-                        )
+                    return cleaned
 
         except socket.timeout:
+
+            # ================================================
+            # eNSP 可能不给最终提示符。
+            #
+            # 如果已经拿到了符合预期的完整业务内容，
+            # 且一段时间没有继续返回数据，
+            # 也可认为该命令结束。
+            # ================================================
+
+            if last_receive_time is None:
+                continue
+
+            cleaned = clean_terminal_output(
+                raw_data
+            )
+
+            valid = validate_output(
+                cleaned,
+                required_any=required_any,
+                required_all=required_all,
+            )
+
+            silent_time = (
+                time.time()
+                - last_receive_time
+            )
+
+            if (
+                valid
+                and silent_time
+                >= quiet_period
+            ):
+
+                return cleaned
+
             continue
 
-    # 超时也返回已经采集到的数据，
-    # 方便后续排错
-    return clean_terminal_output(
+    cleaned = clean_terminal_output(
         raw_data
-    ).strip()
+    )
+
+    raise TimeoutError(
+        "\n"
+        f"命令执行失败或输出不完整：{command}\n"
+        f"已收到内容：\n"
+        f"{cleaned[-1000:]}"
+    )
+
+
+# ============================================================
+# 保存失败调试数据
+# ============================================================
+
+def save_debug_output(
+    command,
+    raw_text,
+):
+    """
+    当某条命令失败时保存调试信息。
+    """
+
+    DEBUG_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    timestamp = (
+        datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    )
+
+    safe_command = (
+        command
+        .replace(
+            " ",
+            "_",
+        )
+        .replace(
+            "/",
+            "_",
+        )
+    )
+
+    debug_file = (
+        DEBUG_DIR
+        / (
+            f"{DEVICE_NAME}_"
+            f"{safe_command}_"
+            f"{timestamp}.txt"
+        )
+    )
+
+    debug_file.write_text(
+        raw_text,
+        encoding="utf-8",
+    )
+
+    return debug_file
 
 
 # ============================================================
@@ -316,16 +572,17 @@ def receive_command_output(
 def send_command(
     sock,
     command,
+    required_any=None,
+    required_all=None,
     timeout=30,
 ):
     """
-    向 Huawei Console 发送一条命令。
+    清理缓冲 → 发送命令 → 接收 → 校验。
     """
 
-    # 清理上一条命令可能残留的数据
     drain_socket(
         sock,
-        max_wait=0.3,
+        max_wait=0.2,
     )
 
     print(
@@ -334,19 +591,75 @@ def send_command(
 
     sock.sendall(
         (
-            f"{command}\r\n"
+            command
+            + "\r\n"
         ).encode(
             "utf-8"
         )
     )
 
-    output = (
-        receive_command_output(
-            sock,
-            command,
-            timeout=timeout,
+    try:
+
+        output = (
+            receive_command_output(
+                sock,
+                command,
+                required_any=required_any,
+                required_all=required_all,
+                timeout=timeout,
+            )
         )
+
+    except Exception as exc:
+
+        debug_file = (
+            save_debug_output(
+                command,
+                str(exc),
+            )
+        )
+
+        raise RuntimeError(
+            f"{exc}\n"
+            f"调试信息已保存："
+            f"{debug_file}"
+        ) from exc
+
+    # ========================================================
+    # 防止只收到 # 之类垃圾内容
+    # ========================================================
+
+    meaningful = output
+
+    meaningful = meaningful.replace(
+        command,
+        "",
     )
+
+    meaningful = meaningful.replace(
+        f"<{DEVICE_NAME}>",
+        "",
+    )
+
+    meaningful = meaningful.replace(
+        f"[{DEVICE_NAME}]",
+        "",
+    )
+
+    meaningful = meaningful.replace(
+        "#",
+        "",
+    )
+
+    meaningful = meaningful.strip()
+
+    if len(meaningful) < 5:
+
+        raise RuntimeError(
+            f"命令 {command} "
+            f"返回有效内容过短："
+            f"{meaningful!r}"
+        )
 
     return output
 
@@ -359,8 +672,10 @@ def save_inspection_result(
     results,
     timestamp,
 ):
+
     OUTPUT_DIR.mkdir(
-        exist_ok=True
+        parents=True,
+        exist_ok=True,
     )
 
     output_file = (
@@ -390,18 +705,19 @@ def save_configuration_backup(
     config_output,
     timestamp,
 ):
-    device_backup_dir = (
+
+    backup_dir = (
         BACKUP_DIR
         / DEVICE_NAME
     )
 
-    device_backup_dir.mkdir(
+    backup_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     backup_file = (
-        device_backup_dir
+        backup_dir
         / (
             f"{DEVICE_NAME}_"
             f"{timestamp}.txt"
@@ -423,23 +739,27 @@ def save_configuration_backup(
 def check_configuration(
     config_output,
 ):
-    """
-    对配置备份做简单完整性检查。
-    """
 
     problems = []
 
     if len(config_output) < 500:
+
         problems.append(
             "配置输出长度过短"
         )
 
-    if "sysname AR1" not in config_output:
+    if (
+        f"sysname {DEVICE_NAME}"
+        not in config_output
+    ):
+
         problems.append(
-            "未检测到 sysname AR1"
+            f"未检测到 sysname "
+            f"{DEVICE_NAME}"
         )
 
     if "return" not in config_output:
+
         problems.append(
             "未检测到配置结束标志 return"
         )
@@ -447,6 +767,7 @@ def check_configuration(
     if MORE_PATTERN.search(
         config_output
     ):
+
         problems.append(
             "配置中仍存在分页提示"
         )
@@ -475,24 +796,12 @@ def main():
             "Console TCP连接成功"
         )
 
-        # ----------------------------------------------------
-        # 清理历史 Console 数据
-        # ----------------------------------------------------
+        # ====================================================
+        # 不再强制同步提示符
+        # ====================================================
 
-        old_data = drain_socket(
-            sock,
-            max_wait=0.5,
-        )
-
-        if old_data.strip():
-            print(
-                "已清理 Console 历史残留数据"
-            )
-
-        print(
-            f"目标设备提示符："
-            f"<{DEVICE_NAME}> / "
-            f"[{DEVICE_NAME}]"
+        wake_console(
+            sock
         )
 
         timestamp = (
@@ -503,11 +812,8 @@ def main():
 
         inspection_results = []
 
-        # ====================================================
-        # 普通 Huawei 巡检
-        # ====================================================
-
         print()
+
         print(
             "========================================"
         )
@@ -520,30 +826,58 @@ def main():
             "========================================"
         )
 
-        for command in (
-            INSPECTION_COMMANDS
-        ):
+        # ====================================================
+        # 巡检命令
+        # ====================================================
 
-            output = send_command(
-                sock,
-                command,
-                timeout=30,
-            )
+        for item in INSPECTION_COMMANDS:
+
+            command = item[
+                "command"
+            ]
+
+            try:
+
+                output = (
+                    send_command(
+                        sock,
+                        command,
+                        required_any=item.get(
+                            "required_any"
+                        ),
+                        required_all=item.get(
+                            "required_all"
+                        ),
+                        timeout=item.get(
+                            "timeout",
+                            30,
+                        ),
+                    )
+                )
+
+            except Exception as exc:
+
+                print()
+                print(
+                    "巡检采集失败"
+                )
+
+                print(
+                    exc
+                )
+
+                print()
+                print(
+                    "本次不会生成假成功巡检文件。"
+                )
+
+                return
 
             section = [
                 "=" * 70,
-                (
-                    f"DEVICE: "
-                    f"{DEVICE_NAME}"
-                ),
-                (
-                    f"CONSOLE: "
-                    f"{HOST}:{PORT}"
-                ),
-                (
-                    f"COMMAND: "
-                    f"{command}"
-                ),
+                f"DEVICE: {DEVICE_NAME}",
+                f"CONSOLE: {HOST}:{PORT}",
+                f"COMMAND: {command}",
                 "=" * 70,
                 output,
             ]
@@ -553,6 +887,10 @@ def main():
                     section
                 )
             )
+
+        # ====================================================
+        # 所有巡检命令成功以后才保存
+        # ====================================================
 
         output_file = (
             save_inspection_result(
@@ -568,7 +906,7 @@ def main():
         )
 
         # ====================================================
-        # Huawei 配置自动备份
+        # 配置备份
         # ====================================================
 
         print()
@@ -584,13 +922,54 @@ def main():
             "========================================"
         )
 
-        config_output = (
-            send_command(
-                sock,
-                BACKUP_COMMAND,
-                timeout=120,
+        try:
+
+            config_output = (
+                send_command(
+                    sock,
+                    BACKUP_COMMAND[
+                        "command"
+                    ],
+                    required_any=(
+                        BACKUP_COMMAND.get(
+                            "required_any"
+                        )
+                    ),
+                    required_all=(
+                        BACKUP_COMMAND.get(
+                            "required_all"
+                        )
+                    ),
+                    timeout=(
+                        BACKUP_COMMAND.get(
+                            "timeout",
+                            120,
+                        )
+                    ),
+                )
             )
-        )
+
+        except Exception as exc:
+
+            print()
+            print(
+                "配置采集失败"
+            )
+
+            print(
+                exc
+            )
+
+            print()
+            print(
+                "本次不会保存无效配置备份。"
+            )
+
+            return
+
+        # ====================================================
+        # 配置完整性
+        # ====================================================
 
         config_length = len(
             config_output
@@ -601,10 +980,6 @@ def main():
             f"配置输出长度："
             f"{config_length} 字符"
         )
-
-        # ====================================================
-        # 配置完整性检查
-        # ====================================================
 
         problems = (
             check_configuration(
@@ -620,32 +995,36 @@ def main():
             )
 
             for problem in problems:
+
                 print(
                     f"  - {problem}"
                 )
 
-        else:
-
             print()
             print(
-                "配置完整性检查：PASS"
+                "完整性检查未通过，"
+                "不保存为有效配置备份。"
             )
 
-            print(
-                "  - 已检测到 sysname AR1"
-            )
+            return
 
-            print(
-                "  - 已检测到 return"
-            )
+        print()
+        print(
+            "配置完整性检查：PASS"
+        )
 
-            print(
-                "  - 未发现残留分页提示"
-            )
+        print(
+            f"  - 已检测到 sysname "
+            f"{DEVICE_NAME}"
+        )
 
-        # ====================================================
-        # 保存配置
-        # ====================================================
+        print(
+            "  - 已检测到 return"
+        )
+
+        print(
+            "  - 未发现残留分页提示"
+        )
 
         backup_file = (
             save_configuration_backup(
@@ -675,4 +1054,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
