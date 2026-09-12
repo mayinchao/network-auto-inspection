@@ -83,5 +83,15 @@ backup/
 
 &#x20;   └── AR1\_20260911\_192926.txt
 
+## 5. 运行效果展示
+
+### 正常状态检测（100/100）
+
+![AR1 Normal](docs/images/ar1_normal_100.png)
+
+### 故障状态检测（20/100）
+
+![AR1 Critical](docs/images/ar1_critical_20.png)
+
 
 
